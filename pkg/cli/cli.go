@@ -1367,6 +1367,14 @@ func runConnectionWebSocketAgentCommand(flags *ConnectFlags, c *command, args []
 			InsecureSkipVerify: true,
 		},
 	}
+	if flags.Proxy != "" {
+		proxyUrl, err := url.Parse(flags.Proxy)
+		if err != nil {
+			log.Fatal("Failed to parse proxy ", flags.Proxy, ": ", err)
+			return err
+		}
+		dialer.Proxy = http.ProxyURL(proxyUrl)
+	}
 	device := args[0]
 	url := wsURL(wsRoot, flags.Zone, flags.host, device)
 	wsConn, _, err := dialer.Dial(url, nil)
