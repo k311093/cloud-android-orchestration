@@ -38,6 +38,10 @@ type Manager interface {
 	GetHostClient(zone string, host string) (HostClient, error)
 }
 
+type HostReadinessChecker interface {
+	IsHostReady() (bool, error)
+}
+
 type HostClient interface {
 	// Get and Post requests return the HTTP status code or an error.
 	// The response body is parsed into the res output parameter if provided.
