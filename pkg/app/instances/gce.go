@@ -18,9 +18,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"path"
 	"regexp"
+	"time"
 
 	apiv1 "github.com/google/cloud-android-orchestration/api/v1"
 	"github.com/google/cloud-android-orchestration/pkg/app/accounts"
@@ -79,27 +81,19 @@ func (m *GCEInstanceManager) ListZones() (*apiv1.ListZonesResponse, error) {
 }
 
 func (m *GCEInstanceManager) GetHostAddr(zone string, host string) (string, error) {
-	instance, err := m.getHostInstance(zone, host)
+	ins, err := m.getHostInstance(zone, host)
 	if err != nil {
 		return "", err
 	}
-	ilen := len(instance.NetworkInterfaces)
-	if ilen == 0 {
-		log.Printf("host instance %s in zone %s is missing a network interface", host, zone)
-		return "", errors.NewInternalError("host instance missing a network interface", nil)
-	}
-	if ilen > 1 {
-		log.Printf("host instance %s in zone %s has %d network interfaces", host, zone, ilen)
-	}
-	return instance.NetworkInterfaces[0].NetworkIP, nil
+	return m.getHostAddrWithIns(ins)
 }
 
 func (m *GCEInstanceManager) GetHostURL(zone string, host string) (*url.URL, error) {
-	addr, err := m.GetHostAddr(zone, host)
+	ins, err := m.getHostInstance(zone, host)
 	if err != nil {
 		return nil, err
 	}
-	return url.Parse(fmt.Sprintf("%s://%s:%d", m.Config.HostOrchestratorProtocol, addr, m.Config.GCP.HostOrchestratorPort))
+	return m.getHostURLWithIns(ins)
 }
 
 const operationStatusDone = "DONE"
@@ -253,16 +247,103 @@ func (m *GCEInstanceManager) WaitOperation(zone string, user accounts.User, name
 	if op.Status != operationStatusDone {
 		return nil, errors.NewServiceUnavailableError("Wait for operation timed out", nil)
 	}
-	getter := opResultGetter{Service: m.Service, Op: op}
-	return getter.Get()
+	getter := opResultGetter{
+		Service: m.Service,
+		Op:      op,
+		Config:  &m.Config,
+	}
+	res, err := getter.Get()
+	if err != nil {
+		return nil, err
+	}
+	if hostInst, ok := res.(*apiv1.HostInstance); ok && op.OperationType == "insert" {
+		return m.waitHostAvailability(zone, user, hostInst.Name)
+	}
+	return res, nil
 }
 
-func (m *GCEInstanceManager) GetHostClient(zone string, host string) (HostClient, error) {
-	url, err := m.GetHostURL(zone, host)
+func (m *GCEInstanceManager) waitHostAvailability(zone string, user accounts.User, host string) (*apiv1.HostInstance, error) {
+	ins, err := m.getHostInstance(zone, host)
+	if err != nil {
+		return nil, err
+	}
+	hostInstance, err := BuildHostInstance(ins)
+	if err != nil {
+		return nil, err
+	}
+	client, err := m.getHostClientWithIns(ins)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.waitForOrchestrator(zone, hostInstance, client); err != nil {
+		return nil, err
+	}
+	return hostInstance, nil
+}
+
+type gceHostReadinessChecker struct {
+	basicChecker *BasicHostReadinessChecker
+	manager      *GCEInstanceManager
+	zone         string
+	hostName     string
+}
+
+func (g *gceHostReadinessChecker) IsHostReady() (bool, error) {
+	_, err := g.manager.Service.Instances.Get(g.manager.Config.GCP.ProjectID, g.zone, g.hostName).Context(context.TODO()).Do()
+	if err != nil {
+		if apiErr, ok := err.(*googleapi.Error); ok && apiErr.Code == http.StatusNotFound {
+			return false, errors.NewNotFoundError("Host was deleted concurrently", err)
+		}
+		return false, fmt.Errorf("failed to check host existence: %w", err)
+	}
+	return g.basicChecker.IsHostReady()
+}
+
+func (m *GCEInstanceManager) waitForOrchestrator(zone string, host *apiv1.HostInstance, client HostClient) error {
+	gceChecker := &gceHostReadinessChecker{
+		basicChecker: &BasicHostReadinessChecker{Client: client},
+		manager:      m,
+		zone:         zone,
+		hostName:     host.Name,
+	}
+
+	return WaitForHostReady(gceChecker, 5*time.Minute, 5*time.Second)
+}
+
+func (m *GCEInstanceManager) getHostAddrWithIns(ins *compute.Instance) (string, error) {
+	ilen := len(ins.NetworkInterfaces)
+	if ilen == 0 {
+		log.Printf("host instance %s in zone %s is missing a network interface", ins.Name, ins.Zone)
+		return "", errors.NewInternalError("host instance missing a network interface", nil)
+	}
+	if ilen > 1 {
+		log.Printf("host instance %s in zone %s has %d network interfaces", ins.Name, ins.Zone, ilen)
+	}
+	return ins.NetworkInterfaces[0].NetworkIP, nil
+}
+
+func (m *GCEInstanceManager) getHostURLWithIns(ins *compute.Instance) (*url.URL, error) {
+	addr, err := m.getHostAddrWithIns(ins)
+	if err != nil {
+		return nil, err
+	}
+	return url.Parse(fmt.Sprintf("%s://%s:%d", m.Config.HostOrchestratorProtocol, addr, m.Config.GCP.HostOrchestratorPort))
+}
+
+func (m *GCEInstanceManager) getHostClientWithIns(ins *compute.Instance) (HostClient, error) {
+	url, err := m.getHostURLWithIns(ins)
 	if err != nil {
 		return nil, err
 	}
 	return NewNetHostClient(url, m.Config.AllowSelfSignedHostSSLCertificate), nil
+}
+
+func (m *GCEInstanceManager) GetHostClient(zone string, host string) (HostClient, error) {
+	ins, err := m.getHostInstance(zone, host)
+	if err != nil {
+		return nil, err
+	}
+	return m.getHostClientWithIns(ins)
 }
 
 func (m *GCEInstanceManager) getHostInstance(zone string, host string) (*compute.Instance, error) {
@@ -326,6 +407,7 @@ var (
 type opResultGetter struct {
 	Service *compute.Service
 	Op      *compute.Operation
+	Config  *Config
 }
 
 func (g *opResultGetter) Get() (any, error) {

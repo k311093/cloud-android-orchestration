@@ -34,7 +34,7 @@ func WaitForHostReady(checker HostReadinessChecker, maxWait time.Duration, retry
 		}
 		time.Sleep(retryDelay)
 	}
-	return errors.NewInternalError("wait for host orchestrator timed out", nil)
+	return errors.NewInternalError("wait for host orchestrator readiness timed out", nil)
 }
 
 type BasicHostReadinessChecker struct {

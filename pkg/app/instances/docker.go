@@ -193,10 +193,7 @@ func (m *DockerInstanceManager) waitCreateHostOperation(host string) (*apiv1.Hos
 					return nil, err
 				}
 				// There is a delay between host creation and its readiness, wait for host readiness and return when it is ready.
-				readinessChecker, ok := client.(HostReadinessChecker)
-				if !ok {
-					readinessChecker = &BasicHostReadinessChecker{Client: client}
-				}
+				readinessChecker := &BasicHostReadinessChecker{Client: client}
 				if err := WaitForHostReady(readinessChecker, 2*time.Minute, 5*time.Second); err != nil {
 					return nil, err
 				}
